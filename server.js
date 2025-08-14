@@ -1,33 +1,81 @@
+// server.js  — VU Studio Booking API (pricing + quote + checkout)
+//
+// Env you should set on Render:
+//   STRIPE_SECRET_KEY              (or STRIPE_SECRET_KEY_TEST / STRIPE_SECRET_KEY_LIVE)
+//   SUCCESS_URL                    (e.g. https://your-site.com/success.html)
+//   CANCEL_URL                     (e.g. https://your-site.com/cancel.html)
+// Optional:
+//   CORS_ORIGIN                    (frontend origin or *)
+//   PORT                           (Render injects 10000 for you)
+
+import 'dotenv/config';
 import express from 'express';
-import Stripe from 'stripe';
 import cors from 'cors';
+import Stripe from 'stripe';
 
 const app = express();
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
-app.use(cors());
 
-// ---------- Pricing calculator (single source of truth) ----------
-function computeTotals(b) {
-  const hours        = Number(b?.hours) || 0;
-  const extraCameras = Number(b?.extraCameras) || 0;
-  const postHours    = Number(b?.postProduction) || 0;
+const PORT = process.env.PORT || 5000;
 
-  // Adjust these if needed to match your pricing
-  const baseRate          = 55;   // $/hr studio
-  const engineerRate      = 20;   // $/hr engineer
-  const extraCamRatePerHr = 25;   // $/hr per extra camera
-  const postRate          = 150;  // $/hr post-production
+// Choose whichever Stripe key you’ve provided
+const STRIPE_KEY =
+  process.env.STRIPE_SECRET_KEY ||
+  process.env.STRIPE_SECRET_KEY_TEST ||
+  process.env.STRIPE_SECRET_KEY_LIVE ||
+  '';
 
-  const baseSubtotal      = hours * baseRate;
-  const engineerSubtotal  = hours * engineerRate;
-  const extrasSession     =
-    (b?.remoteGuest   ? 10  : 0) +
-    (b?.teleprompter  ? 50  : 0) +
-    (extraCameras * extraCamRatePerHr * hours);
-  const postProd          = postHours * postRate;
+const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY) : null;
 
-  const total     = baseSubtotal + engineerSubtotal + extrasSession + postProd;
-  const totalCams = 1 + extraCameras;
+const SUCCESS_URL =
+  process.env.SUCCESS_URL ||
+  'https://example.com/success.html'; // change in Render
+
+const CANCEL_URL =
+  process.env.CANCEL_URL ||
+  'https://example.com/cancel.html'; // change in Render
+
+// ---------- Pricing logic in ONE place ----------
+function computeTotals(b = {}) {
+  // Normalize hours (min 1, max 6; first-time min 2)
+  let hours = Number(b.hours) || 0;
+  const isFirst = !!b.isFirstTime;
+  if (isFirst && hours < 2) hours = 2;
+  if (hours < 1) hours = 1;
+  if (hours > 6) hours = 6;
+
+  // Session mode
+  const mode = String(b.mode || 'ONE_CAMERA').toUpperCase(); // 'AUDIO_ONLY' or 'ONE_CAMERA'
+  const baseRate = mode === 'AUDIO_ONLY' ? 45 : 55; // $/hr
+
+  // Cameras
+  const baseIncludedCams = mode === 'AUDIO_ONLY' ? 0 : 1;
+  const extraCameras = Math.max(0, Number(b.extraCameras) || 0);
+  const totalCams = baseIncludedCams + extraCameras;
+
+  // Engineer
+  const engineerChoice = String(b.engineerChoice || 'any').toLowerCase(); // any | specific | none
+  const wantsEngineer = engineerChoice !== 'none';
+
+  // Subtotals
+  const baseSubtotal = baseRate * hours;
+  const engineerSubtotal = wantsEngineer ? 20 * hours : 0; // $20/hr
+
+  // Per‑session add‑ons (flat)
+  let extrasSession = 0;
+  if (extraCameras > 0) extrasSession += extraCameras * 25; // $25 each
+  if (b.remoteGuest) extrasSession += 10;                    // $10
+  if (b.teleprompter) extrasSession += 25;                   // $25
+  if (b.adClips5) extrasSession += 75;                       // $75
+  if (b.mediaSdOrUsb) extrasSession += 50;                   // $50
+
+  // Post‑production: by # of cams to edit (cap at 4)
+  const camsForPost = Math.min(4, Number(b.postProduction) || totalCams);
+  const postTier = { 0: 0, 1: 200, 2: 250, 3: 300, 4: 350 };
+  const postProd = postTier[camsForPost] ?? 0;
+
+  const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
 
   return {
     breakdown: { baseSubtotal, engineerSubtotal, extrasSession, postProd },
@@ -35,207 +83,132 @@ function computeTotals(b) {
     totalCams
   };
 }
+// -----------------------------------------------
 
-// ---------- Quote (returns numbers only) ----------
+// Health
+app.get('/', (_req, res) => res.json({ ok: true, service: 'vu-studio-booking-api' }));
+
+// Quick environment sanity check
+app.get('/env-check', (_req, res) => {
+  res.json({
+    mode: STRIPE_KEY?.startsWith('sk_live_') ? 'live' : 'test',
+    hasGenericKey: !!process.env.STRIPE_SECRET_KEY,
+    hasTestKey: !!process.env.STRIPE_SECRET_KEY_TEST,
+    hasLiveKey: !!process.env.STRIPE_SECRET_KEY_LIVE,
+    keyLength: (STRIPE_KEY || '').length,
+    port: String(PORT)
+  });
+});
+
+// Totals only
 app.post('/quote', (req, res) => {
   try {
     const totals = computeTotals(req.body || {});
     res.json(totals);
-  } catch (e) {
-    console.error('QUOTE error', e);
-    res.status(500).json({ error: 'quote failed', message: e?.message });
+  } catch (err) {
+    res.status(400).json({ error: 'Bad Request', detail: err?.message });
   }
 });
 
-// ---------- Checkout (recompute totals, create Stripe session) ----------
-app.post('/checkout', async (req, res) => {
-  try {
-    const booking = req.body || {};
-    const totals  = computeTotals(booking);
-
-    // Decide test vs live key automatically (or force test while you validate)
-    const STRIPE_KEY =
-      process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY;
-
-    if (!STRIPE_KEY) {
-      return res.status(400).json({ error: 'No Stripe secret key configured' });
-    }
-
-    const stripe = (await import('stripe')).default(STRIPE_KEY);
-
-    // Amount in cents
-    const amount = Math.round((totals.total || 0) * 100);
-    if (amount <= 0) {
-      return res.status(400).json({ error: 'Invalid total for checkout', totals });
-    }
-
-    // Build a nice line item; you can expand this to multiple lines if you want
-    const lineItemName = `Studio Booking — ${booking?.mode || 'Session'} (${totals.totalCams} cams)`;
-
-    const successUrl = process.env.SUCCESS_URL || 'https://your-frontend-site.com/booking/success';
-    const cancelUrl  = process.env.CANCEL_URL  || 'https://your-frontend-site.com/booking/cancel';
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: { name: lineItemName },
-            unit_amount: amount
-          },
-          quantity: 1
-        }
-      ],
-      metadata: {
-        email: booking?.customer?.email || '',
-        name:  booking?.customer?.name  || '',
-        phone: booking?.customer?.phone || '',
-        date:  booking?.date || '',
-        start: booking?.startTime || '',
-        hours: String(booking?.hours || 0),
-        totalCams: String(totals.totalCams || 1)
-      },
-      success_url: successUrl,
-      cancel_url:  cancelUrl
-    });
-
-    return res.json({ checkoutUrl: session.url, totals });
-  } catch (e) {
-    console.error('CHECKOUT error', e);
-    res.status(500).json({ error: 'checkout failed', message: e?.message });
-  }
-});
-
-
-// --- TEMP: debug tap to see the body & computed totals ---
+// Echo + totals (handy for debugging)
 app.post('/quote-debug', (req, res) => {
   try {
-    const body = req.body || {};
-
-    // If you have a real calculator function, call it here:
-    // const totals = calculateQuote(body);
-
-    // Minimal fallback calculator (so the route always works)
-    // Adjust the rates to your real ones if you have them
-    const hours = Number(body.hours) || 0;
-    const baseRate = 55;            // $55/hr
-    const engineerRate = 20;        // $20/hr
-    const extraCamRatePerHr = 25;   // $25/hr per extra camera
-    const postRate = 150;           // $150/hr of post production
-
-    const extraCameras = Number(body.extraCameras) || 0;
-    const postHours = Number(body.postProduction) || 0;
-
-    const baseSubtotal = hours * baseRate;
-    const engineerSubtotal = hours * engineerRate;
-
-    const extrasSession =
-      (body.remoteGuest ? 10 : 0) +         // example flat fee
-      (body.teleprompter ? 50 : 0) +        // example flat fee
-      (extraCameras * extraCamRatePerHr * hours);
-
-    const postProd = postHours * postRate;
-
-    const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
-    const totalCams = 1 + extraCameras;
-
-    const totals = {
-      breakdown: { baseSubtotal, engineerSubtotal, extrasSession, postProd },
-      total,
-      totalCams
-    };
-
-    res.json({ received: body, totals });
-  } catch (e) {
-    console.error('quote-debug error', e);
-    res.status(500).json({ error: 'quote-debug failed', message: e?.message });
-  }
-});
-
-// --- TEMP: diagnostics to verify env on Render ---
-app.get('/env-check', (req, res) => {
-  res.json({
-    mode: process.env.STRIPE_MODE || 'unset',
-    hasGenericKey: !!process.env.STRIPE_SECRET_KEY,
-    hasTestKey: !!process.env.STRIPE_SECRET_KEY_TEST,
-    hasLiveKey: !!process.env.STRIPE_SECRET_KEY_LIVE,
-    keyLength:
-      (process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY || '').length,
-    port: process.env.PORT || 5000
-  });
-});
-
-// Get Stripe secret key from env
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY;
-if (!stripeSecretKey) {
-  console.error('❌ Missing Stripe secret key. Set STRIPE_SECRET_KEY_TEST or STRIPE_SECRET_KEY in environment variables.');
-  process.exit(1);
-}
-
-const stripe = new Stripe(stripeSecretKey, { apiVersion: '2024-06-20' });
-
-// POST /quote → returns totals from booking.json
-app.post('/quote', (req, res) => {
-  try {
-    const { baseSubtotal = 0, engineerSubtotal = 0, extrasSession = 0, postProd = 0, totalCams = 0 } = req.body;
-
-    const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
-
-    res.json({
-      breakdown: {
-        baseSubtotal,
-        engineerSubtotal,
-        extrasSession,
-        postProd
-      },
-      total,
-      totalCams
-    });
+    const totals = computeTotals(req.body || {});
+    res.json({ received: req.body, totals });
   } catch (err) {
-    console.error('Quote error', err);
-    res.status(500).json({ error: 'Quote error' });
+    res.status(400).json({ error: 'Bad Request', detail: err?.message });
   }
 });
 
-// POST /checkout → creates Stripe Checkout session
+// Create Stripe Checkout Session
 app.post('/checkout', async (req, res) => {
   try {
-    const { total } = req.body;
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: 'Stripe key missing. Set STRIPE_SECRET_KEY (or *_TEST) in Render.' });
+    }
 
-    if (!total || isNaN(total)) {
-      return res.status(400).json({ error: 'Invalid total' });
+    const booking = req.body || {};
+    const totals = computeTotals(booking);
+
+    const hours = Math.max(1, Math.min(6, Number(booking.hours) || 1));
+    const mode = String(booking.mode || 'ONE_CAMERA').replace('_', ' ');
+    const baseRate = String(booking.mode || 'ONE_CAMERA').toUpperCase() === 'AUDIO_ONLY' ? 45 : 55;
+
+    const line_items = [];
+
+    // Base session (per hour)
+    line_items.push({
+      price_data: {
+        currency: 'usd',
+        unit_amount: Math.round(baseRate * 100),
+        product_data: {
+          name: `Studio booking (${mode})`,
+          description: `${hours} hour${hours > 1 ? 's' : ''}`
+        }
+      },
+      quantity: hours
+    });
+
+    // Engineer (per hour)
+    if (totals.breakdown.engineerSubtotal > 0) {
+      line_items.push({
+        price_data: {
+          currency: 'usd',
+          unit_amount: 2000,
+          product_data: { name: 'Studio Engineer' }
+        },
+        quantity: hours
+      });
+    }
+
+    // Session add‑ons (flat)
+    if (totals.breakdown.extrasSession > 0) {
+      line_items.push({
+        price_data: {
+          currency: 'usd',
+          unit_amount: Math.round(totals.breakdown.extrasSession * 100),
+          product_data: { name: 'Session add‑ons' }
+        },
+        quantity: 1
+      });
+    }
+
+    // Post production
+    if (totals.breakdown.postProd > 0) {
+      line_items.push({
+        price_data: {
+          currency: 'usd',
+          unit_amount: Math.round(totals.breakdown.postProd * 100),
+          product_data: {
+            name: `Post‑production (${totals.totalCams} cam${totals.totalCams === 1 ? '' : 's'})`
+          }
+        },
+        quantity: 1
+      });
     }
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: 'Studio Booking'
-            },
-            unit_amount: Math.round(total * 100) // Convert to cents
-          },
-          quantity: 1
-        }
-      ],
       mode: 'payment',
-      success_url: 'https://your-frontend-site.com/success',
-      cancel_url: 'https://your-frontend-site.com/cancel'
+      success_url: SUCCESS_URL,
+      cancel_url: CANCEL_URL,
+      line_items,
+      metadata: {
+        customerName: booking?.customer?.name || '',
+        date: booking?.date || '',
+        startTime: booking?.startTime || '',
+        total: String(totals.total)
+      }
     });
 
-    res.json({ checkoutUrl: session.url });
+    res.json({ checkoutUrl: session.url, totals });
   } catch (err) {
     console.error('Checkout error', err);
-    res.status(500).json({ error: 'Checkout error' });
+    res.status(400).json({ error: 'Checkout error', detail: err?.message });
   }
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`✅ Server listening on ${PORT}`);
+  console.log(`Server listening on ${PORT}`);
 });
