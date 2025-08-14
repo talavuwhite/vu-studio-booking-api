@@ -6,6 +6,109 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ---------- Pricing calculator (single source of truth) ----------
+function computeTotals(b) {
+  const hours        = Number(b?.hours) || 0;
+  const extraCameras = Number(b?.extraCameras) || 0;
+  const postHours    = Number(b?.postProduction) || 0;
+
+  // Adjust these if needed to match your pricing
+  const baseRate          = 55;   // $/hr studio
+  const engineerRate      = 20;   // $/hr engineer
+  const extraCamRatePerHr = 25;   // $/hr per extra camera
+  const postRate          = 150;  // $/hr post-production
+
+  const baseSubtotal      = hours * baseRate;
+  const engineerSubtotal  = hours * engineerRate;
+  const extrasSession     =
+    (b?.remoteGuest   ? 10  : 0) +
+    (b?.teleprompter  ? 50  : 0) +
+    (extraCameras * extraCamRatePerHr * hours);
+  const postProd          = postHours * postRate;
+
+  const total     = baseSubtotal + engineerSubtotal + extrasSession + postProd;
+  const totalCams = 1 + extraCameras;
+
+  return {
+    breakdown: { baseSubtotal, engineerSubtotal, extrasSession, postProd },
+    total,
+    totalCams
+  };
+}
+
+// ---------- Quote (returns numbers only) ----------
+app.post('/quote', (req, res) => {
+  try {
+    const totals = computeTotals(req.body || {});
+    res.json(totals);
+  } catch (e) {
+    console.error('QUOTE error', e);
+    res.status(500).json({ error: 'quote failed', message: e?.message });
+  }
+});
+
+// ---------- Checkout (recompute totals, create Stripe session) ----------
+app.post('/checkout', async (req, res) => {
+  try {
+    const booking = req.body || {};
+    const totals  = computeTotals(booking);
+
+    // Decide test vs live key automatically (or force test while you validate)
+    const STRIPE_KEY =
+      process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY;
+
+    if (!STRIPE_KEY) {
+      return res.status(400).json({ error: 'No Stripe secret key configured' });
+    }
+
+    const stripe = (await import('stripe')).default(STRIPE_KEY);
+
+    // Amount in cents
+    const amount = Math.round((totals.total || 0) * 100);
+    if (amount <= 0) {
+      return res.status(400).json({ error: 'Invalid total for checkout', totals });
+    }
+
+    // Build a nice line item; you can expand this to multiple lines if you want
+    const lineItemName = `Studio Booking — ${booking?.mode || 'Session'} (${totals.totalCams} cams)`;
+
+    const successUrl = process.env.SUCCESS_URL || 'https://your-frontend-site.com/booking/success';
+    const cancelUrl  = process.env.CANCEL_URL  || 'https://your-frontend-site.com/booking/cancel';
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: lineItemName },
+            unit_amount: amount
+          },
+          quantity: 1
+        }
+      ],
+      metadata: {
+        email: booking?.customer?.email || '',
+        name:  booking?.customer?.name  || '',
+        phone: booking?.customer?.phone || '',
+        date:  booking?.date || '',
+        start: booking?.startTime || '',
+        hours: String(booking?.hours || 0),
+        totalCams: String(totals.totalCams || 1)
+      },
+      success_url: successUrl,
+      cancel_url:  cancelUrl
+    });
+
+    return res.json({ checkoutUrl: session.url, totals });
+  } catch (e) {
+    console.error('CHECKOUT error', e);
+    res.status(500).json({ error: 'checkout failed', message: e?.message });
+  }
+});
+
+
 // --- TEMP: debug tap to see the body & computed totals ---
 app.post('/quote-debug', (req, res) => {
   try {
