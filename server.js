@@ -36,43 +36,61 @@ const CANCEL_URL =
   process.env.CANCEL_URL ||
   'https://example.com/cancel.html'; // change in Render
 
-// ---------- Pricing logic in ONE place ----------
+// ---------- Pricing calculator (single source of truth) ----------
 function computeTotals(b = {}) {
-  // Normalize hours (min 1, max 6; first-time min 2)
-  let hours = Number(b.hours) || 0;
+  // Normalize hours: 1–6 normally, but first-time forces min 2
   const isFirst = !!b.isFirstTime;
+  let hours = Number(b.hours) || 0;
   if (isFirst && hours < 2) hours = 2;
   if (hours < 1) hours = 1;
   if (hours > 6) hours = 6;
 
-  // Session mode
-  const mode = String(b.mode || 'ONE_CAMERA').toUpperCase(); // 'AUDIO_ONLY' or 'ONE_CAMERA'
-  const baseRate = mode === 'AUDIO_ONLY' ? 45 : 55; // $/hr
+  // Session mode: AUDIO_ONLY ($45/hr) or ONE_CAMERA ($55/hr)
+  const mode = String(b.mode || 'ONE_CAMERA').toUpperCase();
+  const baseRate = (mode === 'AUDIO_ONLY') ? 45 : 55;
 
-  // Cameras
-  const baseIncludedCams = mode === 'AUDIO_ONLY' ? 0 : 1;
+  // Cameras included by mode (AUDIO_ONLY=0, ONE_CAMERA=1)
+  const baseIncludedCams = (mode === 'AUDIO_ONLY') ? 0 : 1;
+
+  // Client-selected extra cameras (flat per session, not hourly)
   const extraCameras = Math.max(0, Number(b.extraCameras) || 0);
-  const totalCams = baseIncludedCams + extraCameras;
 
-  // Engineer
+  // Start with package cameras + extras
+  let totalCams = baseIncludedCams + extraCameras;
+
+  // NEW: Let "People on Camera" raise the REPORTED cam count (for display/fallback only)
+  const peopleOnCamera = Math.max(0, Number(b.peopleOnCamera) || 0);
+  totalCams = Math.max(totalCams, peopleOnCamera);
+
+  // Engineer fee (+$20/hr) unless "none"
   const engineerChoice = String(b.engineerChoice || 'any').toLowerCase(); // any | specific | none
   const wantsEngineer = engineerChoice !== 'none';
 
   // Subtotals
   const baseSubtotal = baseRate * hours;
-  const engineerSubtotal = wantsEngineer ? 20 * hours : 0; // $20/hr
+  const engineerSubtotal = wantsEngineer ? (20 * hours) : 0;
 
-  // Per‑session add‑ons (flat)
+  // Per-session add-ons (flat)
   let extrasSession = 0;
-  if (extraCameras > 0) extrasSession += extraCameras * 25; // $25 each
-  if (b.remoteGuest) extrasSession += 10;                    // $10
-  if (b.teleprompter) extrasSession += 25;                   // $25
-  if (b.adClips5) extrasSession += 75;                       // $75
-  if (b.mediaSdOrUsb) extrasSession += 50;                   // $50
+  if (extraCameras > 0) extrasSession += extraCameras * 25; // $25 each (flat/session)
+  if (b.remoteGuest)    extrasSession += 10;                // $10
+  if (b.teleprompter)   extrasSession += 25;                // $25
+  if (b.adClips5)       extrasSession += 150;               // $150
+  if (b.mediaSdOrUsb)   extrasSession += 50;                // $50
 
-  // Post‑production: by # of cams to edit (cap at 4)
-  const camsForPost = Math.min(4, Number(b.postProduction) || totalCams);
+  // Post‑production tiers based on cams to edit:
+  // None(0)=$0, 1=$200, 2=$250, 3=$300, 4=$350
+  // RULE: if client explicitly sets 0 -> $0.
+  // If undefined/null -> fallback to totalCams (capped at 4).
   const postTier = { 0: 0, 1: 200, 2: 250, 3: 300, 4: 350 };
+  let camsForPost;
+  if (b.postProduction === 0) {
+    camsForPost = 0; // explicit None
+  } else if (b.postProduction == null || b.postProduction === '') {
+    camsForPost = Math.min(4, totalCams); // fallback uses (possibly raised) totalCams
+  } else {
+    camsForPost = Math.min(4, Number(b.postProduction) || 0);
+  }
   const postProd = postTier[camsForPost] ?? 0;
 
   const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
