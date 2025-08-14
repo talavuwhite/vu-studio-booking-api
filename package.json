@@ -1,52 +1,17 @@
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const Stripe = require('stripe');
-const axios = require('axios');
-
-const app = express();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-app.use(bodyParser.json());
-
-// Test route
-app.get('/', (req, res) => {
-  res.send('VU Studio Booking API is running');
-});
-
-// Stripe webhook
-app.post('/stripe/webhook', bodyParser.raw({ type: 'application/json' }), (request, response) => {
-  const sig = request.headers['stripe-signature'];
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      request.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
-    return response.status(400).send(`Webhook Error: ${err.message}`);
+{
+  "name": "vu-studio-booking-api",
+  "version": "1.0.0",
+  "description": "Studio booking API with Stripe integration",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "stripe": "^14.21.0",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5"
   }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    console.log('Payment successful:', session);
-
-    // Send booking data to GHL
-    axios.post('https://rest.gohighlevel.com/v1/appointments/', {
-      calendarId: process.env.CALENDAR_ID,
-      name: session.customer_details.name,
-      email: session.customer_details.email
-    }, {
-      headers: { Authorization: `Bearer ${process.env.GHL_API_KEY}` }
-    }).then(() => console.log('Booking sent to GHL'))
-      .catch(err => console.error('GHL Error:', err.message));
-  }
-
-  response.json({ received: true });
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
