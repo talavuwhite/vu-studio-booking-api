@@ -6,6 +6,51 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// --- TEMP: debug tap to see the body & computed totals ---
+app.post('/quote-debug', (req, res) => {
+  try {
+    const body = req.body || {};
+
+    // If you have a real calculator function, call it here:
+    // const totals = calculateQuote(body);
+
+    // Minimal fallback calculator (so the route always works)
+    // Adjust the rates to your real ones if you have them
+    const hours = Number(body.hours) || 0;
+    const baseRate = 55;            // $55/hr
+    const engineerRate = 20;        // $20/hr
+    const extraCamRatePerHr = 25;   // $25/hr per extra camera
+    const postRate = 150;           // $150/hr of post production
+
+    const extraCameras = Number(body.extraCameras) || 0;
+    const postHours = Number(body.postProduction) || 0;
+
+    const baseSubtotal = hours * baseRate;
+    const engineerSubtotal = hours * engineerRate;
+
+    const extrasSession =
+      (body.remoteGuest ? 10 : 0) +         // example flat fee
+      (body.teleprompter ? 50 : 0) +        // example flat fee
+      (extraCameras * extraCamRatePerHr * hours);
+
+    const postProd = postHours * postRate;
+
+    const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
+    const totalCams = 1 + extraCameras;
+
+    const totals = {
+      breakdown: { baseSubtotal, engineerSubtotal, extrasSession, postProd },
+      total,
+      totalCams
+    };
+
+    res.json({ received: body, totals });
+  } catch (e) {
+    console.error('quote-debug error', e);
+    res.status(500).json({ error: 'quote-debug failed', message: e?.message });
+  }
+});
+
 // --- TEMP: diagnostics to verify env on Render ---
 app.get('/env-check', (req, res) => {
   res.json({
