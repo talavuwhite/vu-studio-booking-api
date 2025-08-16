@@ -1,208 +1,341 @@
-// server.js — VU Studio Booking API (fixed post-production $0 for None)
+/**
+ * VU Studio Booking API
+ * - Pricing/quote + Stripe Checkout (promo/coupons entered on Stripe page)
+ *
+ * ENV you should set on Render:
+ *   STRIPE_SECRET_KEY            (or STRIPE_SECRET_KEY_TEST / STRIPE_SECRET_KEY_LIVE)
+ *   SUCCESS_URL                  (e.g. https://vizionzunlimited.com/bookingsuccess)
+ *   CANCEL_URL                   (e.g. https://vizionzunlimited.com/bookingcancel)
+ * Optional:
+ *   CORS_ORIGIN                  (frontend origin, e.g. https://vizionzunlimited.com or *)
+ *   PORT                         (Render injects 10000 automatically)
+ */
 
 import express from "express";
 import cors from "cors";
-import "dotenv/config";
-import StripePkg from "stripe";
+import Stripe from "stripe";
 
-const app = express();
-
-// ---- CORS ----
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-app.use(
-  cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-    credentials: false,
-  })
-);
-app.use(express.json());
-
-// ---- Stripe init (auto-pick secret) ----
+// ---------- Env & Stripe ----------
 const stripeSecret =
   process.env.STRIPE_SECRET_KEY ||
   process.env.STRIPE_SECRET_KEY_LIVE ||
   process.env.STRIPE_SECRET_KEY_TEST ||
-  "";
-const stripe =
-  stripeSecret ? new StripePkg.Stripe(stripeSecret, { apiVersion: "2024-06-20" }) : null;
+  null;
 
-// ---- URLs ----
+const stripe = stripeSecret
+  ? new Stripe(stripeSecret, { apiVersion: "2024-06-20" })
+  : null;
+
 const SUCCESS_URL = process.env.SUCCESS_URL || "";
 const CANCEL_URL = process.env.CANCEL_URL || "";
 
-// ---- Helpers: Pricing Rules ----
-const HOURLY_AUDIO = 45; // $/hr
-const HOURLY_ONE_CAM = 55; // $/hr (min 2 hours overall)
-const HOURLY_ENGINEER = 20; // $/hr
+const PORT = process.env.PORT || 10000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-const EXTRA_CAMERA_SESSION = 25; // $/session
-const REMOTE_GUEST_SESSION = 10; // $/session
-const TELEPROMPTER_SESSION = 25; // $/session
-const AD_CLIPS_5_SESSION = 150; // $/session
-const MEDIA_SD_USB_SESSION = 50; // $/session
+// ---------- App ----------
+const app = express();
+app.use(express.json());
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+  })
+);
 
-// Post-production flat tier (0 is FREE)
-const POST_TIER = { 0: 0, 1: 200, 2: 250, 3: 300, 4: 350 };
+// ---------- Utilities / Pricing ----------
 
-// Normalize booleans safely
-function toBool(v) {
-  if (typeof v === "boolean") return v;
-  if (typeof v === "string") return ["true", "1", "yes", "on"].includes(v.toLowerCase());
-  return !!v;
-}
+// Hourly rates
+const RATES = {
+  AUDIO_ONLY: 45, // $/hr
+  ONE_CAMERA: 55, // $/hr
+  ENGINEER_PER_HOUR: 20, // $/hr
+};
 
-// Main calculator (single source of truth)
-function computeTotals(body) {
+// Per-session add-ons (flat)
+const ADDONS = {
+  EXTRA_CAMERA_EACH: 25, // per extra camera (flat per session)
+  REMOTE_GUEST: 10,
+  TELEPROMPTER: 25,
+  AD_CLIPS_5: 150,
+  MEDIA_SD_OR_USB: 50,
+};
+
+// Post-production tier (flat per session) by number of cams to edit (0-4)
+const POST_TIER = {
+  0: 0,
+  1: 200,
+  2: 250,
+  3: 300,
+  4: 350,
+};
+
+// Compute totals according to business rules
+function computeTotals(body = {}) {
+  // Normalize
   const b = body || {};
+  const isFirst = !!b.isFirstTime;
 
-  const hours = Math.max(2, Number(b.hours || 2));
+  // Hours guardrails:
+  // - Overall min 1 hr, but if first-time then min 2 hrs.
+  let hours = Number(b.hours) || 0;
+  if (isFirst && hours < 2) hours = 2;
+  if (!isFirst && hours < 1) hours = 1;
 
-  // Base rate: Audio vs One Cam
-  const mode = (b.mode || "ONE_CAMERA").toUpperCase();
-  const baseRate = mode === "AUDIO_ONLY" ? HOURLY_AUDIO : HOURLY_ONE_CAM;
-  const baseSubtotal = baseRate * hours;
+  // Mode
+  const mode = String(b.mode || "ONE_CAMERA").toUpperCase(); // AUDIO_ONLY or ONE_CAMERA
+  const baseRate = mode === "AUDIO_ONLY" ? RATES.AUDIO_ONLY : RATES.ONE_CAMERA;
 
-  // Engineer
-  const engineerChoice = (b.engineerChoice || "any").toLowerCase(); // any|none|name
-  const wantsEngineer = engineerChoice !== "none";
-  const engineerSubtotal = wantsEngineer ? HOURLY_ENGINEER * hours : 0;
-
-  // Session add-ons
-  const extraCameras = Math.max(0, Number(b.extraCameras || 0));
-  let extrasSession = 0;
-  if (extraCameras > 0) extrasSession += extraCameras * EXTRA_CAMERA_SESSION;
-  if (toBool(b.remoteGuest)) extrasSession += REMOTE_GUEST_SESSION;
-  if (toBool(b.teleprompter)) extrasSession += TELEPROMPTER_SESSION;
-  if (toBool(b.adClips5)) extrasSession += AD_CLIPS_5_SESSION;
-  if (toBool(b.mediaSdOrUsb)) extrasSession += MEDIA_SD_USB_SESSION;
-
-  // Cameras count for display (does NOT set price by itself)
+  // Base included cameras: AUDIO_ONLY = 0; ONE_CAMERA = 1
   const baseIncludedCams = mode === "AUDIO_ONLY" ? 0 : 1;
-  const peopleOnCamera = Math.max(1, Number(b.peopleOnCamera || 1));
-  const totalCams = baseIncludedCams + extraCameras + Math.max(0, peopleOnCamera - 1);
 
-  // ---- FIX: Post Production (0 -> $0, no fallback) ----
-  const camsForPost = Math.max(0, Number(b.postProduction || 0)); // strictly what user selected
+  // People on camera affects total camera count only (no price change),
+  // but we'll use the resulting total when computing post-production default.
+  const peopleOnCamera = Math.max(0, Number(b.peopleOnCamera) || 0);
+
+  // Extra cameras are optional paid add-ons (flat per session)
+  const extraCameras = Math.max(0, Number(b.extraCameras) || 0);
+
+  // Total cams = max(base + extras, people on camera)
+  const totalCams = Math.max(baseIncludedCams + extraCameras, peopleOnCamera);
+
+  // Engineer choice: 'any' | 'specific' | 'none'
+  const engineerChoice = String(b.engineerChoice || "any").toLowerCase();
+  const wantsEngineer = engineerChoice !== "none";
+
+  // Subtotals
+  const baseSubtotal = baseRate * hours;
+  const engineerSubtotal = wantsEngineer ? RATES.ENGINEER_PER_HOUR * hours : 0;
+
+  // Per-session add-ons (flat)
+  let extrasSession = 0;
+  if (extraCameras > 0)
+    extrasSession += extraCameras * ADDONS.EXTRA_CAMERA_EACH;
+  if (b.remoteGuest) extrasSession += ADDONS.REMOTE_GUEST;
+  if (b.teleprompter) extrasSession += ADDONS.TELEPROMPTER;
+  if (b.adClips5) extrasSession += ADDONS.AD_CLIPS_5;
+  if (b.mediaSdOrUsb) extrasSession += ADDONS.MEDIA_SD_OR_USB;
+
+  // Post-production
+  // If client selected `postProduction` as number of cams to edit, use that.
+  // Otherwise, default to totalCams (max 4).
+  let camsForPost = 0;
+  if (b.postProduction === "" || b.postProduction === null || b.postProduction === undefined) {
+    camsForPost = 0;
+  } else {
+    camsForPost = Math.min(4, Math.max(0, Number(b.postProduction) || 0));
+  }
+  // Guard: 0 cams means $0 (this fixes the "None still charges $200" bug)
   const postProd = POST_TIER[camsForPost] ?? 0;
 
   const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
 
   return {
-    breakdown: { baseSubtotal, engineerSubtotal, extrasSession, postProd },
+    totals: {
+      baseSubtotal,
+      engineerSubtotal,
+      extrasSession,
+      postProd,
+    },
     total,
     totalCams,
+    hours,
+    mode,
+    wantsEngineer,
+    extraCameras,
+    camsForPost,
+    baseRate,
   };
 }
 
-// ---- Health & Diagnostics ----
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+// ---------- Routes ----------
 
-app.get("/env-check", (_req, res) => {
-  const mode = stripeSecret.startsWith("sk_live_")
-    ? "live"
-    : stripeSecret.startsWith("sk_test_")
-    ? "test"
-    : "none";
+// Quick status check for Render
+app.get("/env-check", (req, res) => {
+  const hasLive = !!process.env.STRIPE_SECRET_KEY_LIVE;
+  const hasTest =
+    !!process.env.STRIPE_SECRET_KEY || !!process.env.STRIPE_SECRET_KEY_TEST;
+
+  const mode =
+    hasLive ? "live" : hasTest ? "test" : "none";
 
   res.json({
     mode,
     hasKey: !!stripeSecret,
-    hasStripe: !!stripe,
-    successUrlSet: !!SUCCESS_URL,
-    cancelUrlSet: !!CANCEL_URL,
-    port: String(process.env.PORT || 5000),
+    keyLength: stripeSecret ? stripeSecret.length : 0,
+    port: String(PORT),
   });
 });
 
-// ---- Quote ----
+// Compute price quote (no Stripe call)
 app.post("/quote", (req, res) => {
   try {
     const result = computeTotals(req.body || {});
-    return res.json(result);
-  } catch (e) {
-    return res.status(400).json({ error: e?.message || "Failed to compute quote" });
+    return res.json({
+      ...result,
+      breakdown: result.totals,
+    });
+  } catch (err) {
+    console.error("QUOTE ERROR:", err);
+    return res.status(400).json({ error: "Invalid request" });
   }
 });
 
-// ---- Checkout (Stripe) ----
+// Stripe Checkout (promo code is entered by the customer on the Stripe page)
 app.post("/checkout", async (req, res) => {
   try {
-    if (!stripe || !stripeSecret) {
-      return res.status(500).json({ error: "Stripe not configured" });
+    if (!stripe) {
+      return res.status(503).json({ error: "Stripe not configured." });
     }
     if (!SUCCESS_URL || !CANCEL_URL) {
-      return res.status(500).json({ error: "Missing SUCCESS_URL or CANCEL_URL" });
+      return res
+        .status(500)
+        .json({ error: "SUCCESS_URL/CANCEL_URL are not set on the server." });
     }
 
-    const payload = req.body || {};
-    const { total } = computeTotals(payload);
+    const b = req.body || {};
+    const {
+      totals,
+      totalCams,
+      hours,
+      mode,
+      wantsEngineer,
+      extraCameras,
+      camsForPost,
+      baseRate,
+    } = computeTotals(b);
 
-    // Basic guards
-    const c = payload.customer || {};
-    if (!c.name || !c.email || !payload.date || !payload.startTime) {
-      return res.status(400).json({ error: "Missing required fields (name, email, date, startTime)" });
+    const customer = b.customer || {};
+    const room = String(b.room || "The Studio");
+
+    // Build line items
+    const line_items = [];
+
+    // Base booking (hourly)
+    line_items.push({
+      price_data: {
+        currency: "usd",
+        product_data: {
+          name:
+            mode === "AUDIO_ONLY"
+              ? "Studio booking (AUDIO ONLY)"
+              : "Studio booking (ONE CAMERA)",
+        },
+        unit_amount: Math.round(baseRate * 100), // cents
+      },
+      quantity: Math.max(1, hours),
+    });
+
+    // Engineer (hourly)
+    if (wantsEngineer) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: "Studio Engineer" },
+          unit_amount: Math.round(RATES.ENGINEER_PER_HOUR * 100),
+        },
+        quantity: Math.max(1, hours),
+      });
     }
 
-    // Create a single line item representing the session
-    const sessionTitle = `Studio Booking — ${payload.room || "Room"} — ${payload.date} @ ${payload.startTime}`;
-    const description = [
-      `Mode: ${payload.mode || "ONE_CAMERA"}`,
-      `Hours: ${payload.hours || 2}`,
-      `Engineer: ${payload.engineerChoice || "any"}`,
-      `People on Camera: ${payload.peopleOnCamera || 1}`,
-      `Extras: extCams=${payload.extraCameras || 0}, remote=${toBool(payload.remoteGuest) ? "Y" : "N"},` +
-        ` tele=${toBool(payload.teleprompter) ? "Y" : "N"}, clips=${toBool(payload.adClips5) ? "Y" : "N"}, media=${toBool(payload.mediaSdOrUsb) ? "Y" : "N"}`,
-      `Post: ${Number(payload.postProduction || 0)} cams`,
-    ].join(" | ");
+    // Per-session add-ons (flat)
+    if (extraCameras > 0) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Extra cameras (${extraCameras})` },
+          unit_amount: Math.round(ADDONS.EXTRA_CAMERA_EACH * extraCameras * 100),
+        },
+        quantity: 1,
+      });
+    }
+    if (b.remoteGuest) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: "Remote Guest" },
+          unit_amount: ADDONS.REMOTE_GUEST * 100,
+        },
+        quantity: 1,
+      });
+    }
+    if (b.teleprompter) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: "Teleprompter" },
+          unit_amount: ADDONS.TELEPROMPTER * 100,
+        },
+        quantity: 1,
+      });
+    }
+    if (b.adClips5) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: "5 Ad Clips" },
+          unit_amount: ADDONS.AD_CLIPS_5 * 100,
+        },
+        quantity: 1,
+      });
+    }
+    if (b.mediaSdOrUsb) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: "Media to SD/USB" },
+          unit_amount: ADDONS.MEDIA_SD_OR_USB * 100,
+        },
+        quantity: 1,
+      });
+    }
+
+    // Post-production (flat; 0 cams => $0, so skip when 0)
+    if (camsForPost > 0) {
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Post Production (${camsForPost} cam${camsForPost > 1 ? "s" : ""})` },
+          unit_amount: POST_TIER[camsForPost] * 100,
+        },
+        quantity: 1,
+      });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
+      allow_promotion_codes: true, // lets customer enter coupon on Stripe page
       success_url: SUCCESS_URL,
       cancel_url: CANCEL_URL,
-      allow_promotion_codes: true, // coupons handled on Stripe page
-      customer_email: c.email,
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: "usd",
-            unit_amount: Math.round(Number(total || 0) * 100), // cents
-            product_data: {
-              name: sessionTitle,
-              description,
-            },
-          },
-        },
-      ],
+      line_items,
       metadata: {
-        customer_name: c.name,
-        customer_phone: c.phone || "",
-        room: payload.room || "",
-        date: payload.date || "",
-        startTime: payload.startTime || "",
-        hours: String(payload.hours || 2),
-        mode: payload.mode || "",
-        engineerChoice: payload.engineerChoice || "",
-        peopleOnCamera: String(payload.peopleOnCamera || 1),
-        extraCameras: String(payload.extraCameras || 0),
-        remoteGuest: toBool(payload.remoteGuest) ? "true" : "false",
-        teleprompter: toBool(payload.teleprompter) ? "true" : "false",
-        adClips5: toBool(payload.adClips5) ? "true" : "false",
-        mediaSdOrUsb: toBool(payload.mediaSdOrUsb) ? "true" : "false",
-        postProduction: String(payload.postProduction || 0),
-        notes: payload.notes || "",
+        room,
+        date: String(b.date || ""),
+        startTime: String(b.startTime || ""),
+        hours: String(hours),
+        mode,
+        totalCams: String(totalCams),
+        engineer: wantsEngineer ? "yes" : "no",
+        extraCameras: String(extraCameras),
+        postProductionCams: String(camsForPost),
+        customer_name: String(customer.name || ""),
+        customer_email: String(customer.email || ""),
+        customer_phone: String(customer.phone || ""),
+        notes: String(b.notes || ""),
       },
     });
 
     return res.json({ checkoutUrl: session.url });
-  } catch (e) {
-    console.error("Checkout error:", e);
-    return res.status(500).json({ error: e?.message || "Checkout failed" });
+  } catch (err) {
+    console.error("CHECKOUT ERROR:", err);
+    return res.status(400).json({ error: "Checkout failed.", details: String(err.message || err) });
   }
 });
 
-// ---- Start ----
-const PORT = process.env.PORT || 5000; // Render injects 10000
+// Root
+app.get("/", (req, res) => {
+  res.type("text").send("VU Studio Booking API is running.");
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`VU Booking API listening on ${PORT}`);
+  console.log(`VU Studio Booking API listening on :${PORT}`);
 });
