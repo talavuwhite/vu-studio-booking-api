@@ -1,90 +1,62 @@
-// server.js — VU Studio Booking API with Coupons (Promo Codes)
-//
-// Set these in Render → Environment:
-//   STRIPE_SECRET_KEY     (your sk_test_... or sk_live_...)
-//   SUCCESS_URL           (https://your-site.com/success.html)
-//   CANCEL_URL            (https://your-site.com/cancel.html)
-// Optional:
-//   CORS_ORIGIN           (frontend origin or *)
-//   PORT                  (Render injects 10000)
+// server.js — VU Studio Booking API
+// Pricing + Quote + Checkout + Discount preview + On-page payment
 
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import Stripe from 'stripe';
 
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
 
-const PORT = process.env.PORT || 5000;
+// CORS
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN }));
 
-const STRIPE_KEY =
-  process.env.STRIPE_SECRET_KEY ||
-  process.env.STRIPE_SECRET_KEY_TEST ||
-  process.env.STRIPE_SECRET_KEY_LIVE ||
-  '';
+// Stripe
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY_TEST || '';
+const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET, { apiVersion: '2023-10-16' }) : null;
 
-const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY) : null;
-
+// Success/Cancel
 const SUCCESS_URL = process.env.SUCCESS_URL || 'https://example.com/success.html';
 const CANCEL_URL  = process.env.CANCEL_URL  || 'https://example.com/cancel.html';
 
-// ---------- Pricing calculator (single source of truth) ----------
+// ---- Pricing function (same logic we’ve been using) ----
 function computeTotals(b = {}) {
-  // Normalize hours: first-time min 2, absolute min 1, max 6
+  // Normalize
   const isFirst = !!b.isFirstTime;
   let hours = Number(b.hours) || 0;
   if (isFirst && hours < 2) hours = 2;
-  if (hours < 1) hours = 1;
+  if (hours < 2) hours = 2;
   if (hours > 6) hours = 6;
 
-  // Session mode: AUDIO_ONLY ($45/hr) or ONE_CAMERA ($55/hr)
-  const mode = String(b.mode || 'ONE_CAMERA').toUpperCase();
-  const baseRate = (mode === 'AUDIO_ONLY') ? 45 : 55;
+  const mode = String(b.mode || 'ONE_CAMERA').toUpperCase(); // ONE_CAMERA or AUDIO_ONLY
+  const baseRate = (mode === 'AUDIO_ONLY') ? 45 : 55; // $/hr
 
-  // Cameras included by mode (AUDIO_ONLY=0, ONE_CAMERA=1)
+  // Base cameras included: AUDIO_ONLY=0, ONE_CAMERA=1
   const baseIncludedCams = (mode === 'AUDIO_ONLY') ? 0 : 1;
 
-  // Extra cameras (flat per session, not hourly)
   const extraCameras = Math.max(0, Number(b.extraCameras) || 0);
+  const totalCams = baseIncludedCams + extraCameras;
 
-  // Start with package cameras + extras
-  let totalCams = baseIncludedCams + extraCameras;
-
-  // Let "People on Camera" raise the reported cam count (display/fallback only; no price impact)
-  const peopleOnCamera = Math.max(0, Number(b.peopleOnCamera) || 0);
-  totalCams = Math.max(totalCams, peopleOnCamera);
-
-  // Engineer fee (+$20/hr) unless "none"
-  const engineerChoice = String(b.engineerChoice || 'any').toLowerCase(); // any | specific | none
+  // Engineer
+  const engineerChoice = String(b.engineerChoice || 'any').toLowerCase(); // any|specific|none
   const wantsEngineer = engineerChoice !== 'none';
 
   // Subtotals
   const baseSubtotal = baseRate * hours;
   const engineerSubtotal = wantsEngineer ? (20 * hours) : 0;
 
-  // Per-session add-ons (flat)
+  // Per-session add-ons
   let extrasSession = 0;
-  if (extraCameras > 0) extrasSession += extraCameras * 25; // $25 each
-  if (b.remoteGuest)    extrasSession += 10;                // $10
-  if (b.teleprompter)   extrasSession += 25;                // $25
-  if (b.adClips5)       extrasSession += 150;               // $150
-  if (b.mediaSdOrUsb)   extrasSession += 50;                // $50
+  if (extraCameras > 0) extrasSession += extraCameras * 25; // $25 ea (flat / session)
+  if (b.remoteGuest)   extrasSession += 10;
+  if (b.teleprompter)  extrasSession += 25;
+  if (b.adClips5)      extrasSession += 150;
+  if (b.mediaSdOrUsb)  extrasSession += 50;
 
-  // Post-production tiers based on cams to edit:
-  // None(0)=$0, 1=$200, 2=$250, 3=$300, 4=$350
-  // If client explicitly sets 0 -> $0
-  // If undefined/null -> fallback to totalCams (cap at 4)
-  const postTier = { 0: 0, 1: 200, 2: 250, 3: 300, 4: 350 };
-  let camsForPost;
-  if (b.postProduction === 0) {
-    camsForPost = 0; // explicit None
-  } else if (b.postProduction == null || b.postProduction === '') {
-    camsForPost = Math.min(4, totalCams); // fallback uses (possibly raised) totalCams
-  } else {
-    camsForPost = Math.min(4, Number(b.postProduction) || 0);
-  }
+  // Post-production: number of cams to edit (0=none)
+  const camsForPost = Math.min(4, Number(b.postProduction) || totalCams);
+  const postTier = { 0:0, 1:200, 2:250, 3:300, 4:350 };
   const postProd = postTier[camsForPost] ?? 0;
 
   const total = baseSubtotal + engineerSubtotal + extrasSession + postProd;
@@ -96,225 +68,162 @@ function computeTotals(b = {}) {
   };
 }
 
-// ---------- Optional: server-side business rule validation ----------
-function validateBusinessRules(b) {
-  // Date ≥ 2 days out & Mon–Fri
-  if (b.date) {
-    const today = new Date(); today.setHours(0,0,0,0);
-    const min = new Date(today); min.setDate(min.getDate() + 2);
-    const sel = new Date(`${b.date}T00:00:00`);
-    if (sel < min) return 'Date must be at least 2 days from today.';
-    const dow = sel.getDay(); // 0 Sun..6 Sat
-    if (dow === 0 || dow === 6) return 'Bookings are Monday–Friday only.';
-  }
-  // Start time must be 10:00–19:00 (end may go past 19:00)
-  if (b.startTime) {
-    const [H, M] = String(b.startTime).split(':').map(Number);
-    const start = H * 60 + (M || 0);
-    const open = 10 * 60, close = 19 * 60;
-    if (start < open || start > close) return 'Start time must be between 10:00 AM and 7:00 PM.';
-  }
-  // Hours min 2, max 6
-  const isFirst = !!b.isFirstTime;
-  const hours = Number(b.hours) || 0;
-  if (isFirst && hours < 2) return 'First-time bookings must be at least 2 hours.';
-  if (hours < 2) return 'Minimum booking is 2 hours.';
-  if (hours > 6) return 'Maximum booking is 6 hours.';
-  return '';
-}
-
-// ---------- Stripe coupon helpers ----------
-async function lookupPromotionCode(code) {
+// ---- Helpers: Stripe promo lookup & discount math ----
+async function findPromotionCode(code) {
   if (!stripe || !code) return null;
-  const list = await stripe.promotionCodes.list({
-    code: String(code).trim(),
-    active: true,
-    limit: 1,
-    expand: ['data.coupon']
-  });
+  const list = await stripe.promotionCodes.list({ code, limit: 1 });
   return list.data[0] || null;
 }
+function applyDiscount(original, promotion) {
+  if (!promotion) return { totalAfter: original, discount: { amount: 0, code: null, promo: null } };
+  const coup = promotion.coupon;
+  let off = 0;
+  if (coup.amount_off) off = coup.amount_off / 100;
+  else if (coup.percent_off) off = (original * coup.percent_off) / 100;
 
-function applyCouponToTotal(total, coupon) {
-  if (!coupon) return { discountedTotal: total, discountAmount: 0 };
-  const { percent_off, amount_off, currency } = coupon;
-
-  if (percent_off) {
-    const discountAmount = Math.round(total * (percent_off / 100));
-    return { discountedTotal: Math.max(0, total - discountAmount), discountAmount };
-  }
-  if (amount_off && (!currency || String(currency).toLowerCase() === 'usd')) {
-    const discountAmount = Math.min(total, amount_off);
-    return { discountedTotal: Math.max(0, total - discountAmount), discountAmount };
-  }
-  return { discountedTotal: total, discountAmount: 0 };
+  const totalAfter = Math.max(0, Math.round((original - off) * 100) / 100);
+  return {
+    totalAfter,
+    discount: {
+      amount: Math.round(off * 100) / 100,
+      code: promotion.code,
+      promo: promotion.id
+    }
+  };
 }
 
-// ---------- Routes ----------
-app.get('/', (_req, res) => res.json({ ok: true, service: 'vu-studio-booking-api' }));
-
-app.get('/env-check', (_req, res) => {
+// ---- Health/diagnostics ----
+app.get('/env-check', (req, res) => {
   res.json({
-    mode: STRIPE_KEY?.startsWith('sk_live_') ? 'live' : 'test',
-    hasKey: !!STRIPE_KEY,
-    port: String(PORT)
+    mode: STRIPE_SECRET ? (STRIPE_SECRET.startsWith('sk_live') ? 'live' : 'test') : 'none',
+    hasKey: !!STRIPE_SECRET,
+    port: String(process.env.PORT || 5000)
   });
 });
 
-// Quote with optional coupon code
-app.post('/quote', async (req, res) => {
+// Original quote (no discount)
+app.post('/quote', (req, res) => {
+  try { res.json(computeTotals(req.body || {})); }
+  catch (e) { res.status(400).json({ error: String(e?.message || e) }); }
+});
+
+// Quote WITH Stripe discount preview
+app.post('/quote-with-discount', async (req, res) => {
   try {
-    const booking = req.body || {};
-
-    const violation = validateBusinessRules(booking);
-    if (violation) return res.status(400).json({ error: violation });
-
-    const totals = computeTotals(booking);
-
-    // Coupon (optional)
-    let discount = { discountedTotal: totals.total, discountAmount: 0 };
-    let promoSummary = null;
-
-    if (booking.couponCode) {
-      const promo = await lookupPromotionCode(booking.couponCode);
-      if (promo?.coupon) {
-        discount = applyCouponToTotal(totals.total, promo.coupon);
-        promoSummary = {
-          code: promo.code,
-          coupon: {
-            id: promo.coupon.id,
-            percent_off: promo.coupon.percent_off || null,
-            amount_off: promo.coupon.amount_off || null,
-            currency: promo.coupon.currency || 'usd'
-          }
-        };
-      }
+    const b = req.body || {};
+    const base = computeTotals(b);
+    let promo = null;
+    if (b.couponCode && stripe) {
+      promo = await findPromotionCode(String(b.couponCode).trim());
+      if (!promo || promo.active === false) promo = null;
     }
+    const { totalAfter, discount } = applyDiscount(base.total, promo);
+    res.json({ ...base, totalAfter, discount });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
+  }
+});
+
+// Publishable key for on-page payment
+app.get('/public-keys', (req, res) => {
+  const pub = process.env.STRIPE_PUBLISHABLE_KEY || process.env.STRIPE_PUBLISHABLE_KEY_TEST || '';
+  res.json({ publishableKey: pub });
+});
+
+// Create PaymentIntent for on-page payment (Elements)
+app.post('/pay/create-intent', async (req, res) => {
+  try {
+    if (!stripe) return res.status(400).json({ error: 'Stripe not configured.' });
+    const b = req.body || {};
+    const base = computeTotals(b);
+
+    let promo = null;
+    if (b.couponCode) {
+      promo = await findPromotionCode(String(b.couponCode).trim());
+      if (!promo || promo.active === false) promo = null;
+    }
+    const { totalAfter } = applyDiscount(base.total, promo);
+    const amount = Math.max(0, Math.round(totalAfter * 100));
+
+    const intent = await stripe.paymentIntents.create({
+      amount,
+      currency: 'usd',
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        room: b.room || '',
+        date: b.date || '',
+        startTime: b.startTime || '',
+        hours: String(b.hours || 0),
+        engineerChoice: b.engineerChoice || '',
+        engineerName: b.engineerName || '',
+        peopleOnCamera: String(b.peopleOnCamera || 1),
+        couponCode: b.couponCode || ''
+      }
+    });
 
     res.json({
-      ...totals,
-      discount: { amount: discount.discountAmount, code: promoSummary?.code || null },
-      total: discount.discountedTotal, // show discounted total
-      promo: promoSummary
+      clientSecret: intent.client_secret,
+      display: { totalAfter, breakdown: base.breakdown, totalCams: base.totalCams }
     });
-  } catch (err) {
-    console.error('QUOTE error', err);
-    res.status(400).json({ error: 'Bad Request', detail: err?.message });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
   }
 });
 
-// Debug echo
-app.post('/quote-debug', async (req, res) => {
-  try {
-    const booking = req.body || {};
-    const totals = computeTotals(booking);
-    res.json({ received: booking, totals });
-  } catch (err) {
-    res.status(400).json({ error: 'Bad Request', detail: err?.message });
-  }
-});
-
-// Checkout — pre-apply coupon if present; otherwise allow entry on Stripe
+// Hosted checkout (keeps allow_promotion_codes + applies a specific code if present)
 app.post('/checkout', async (req, res) => {
   try {
-    if (!stripe) {
-      return res.status(500).json({ error: 'Stripe not configured' });
+    if (!stripe) return res.status(400).json({ error: 'Stripe not configured.' });
+    const b = req.body || {};
+    const base = computeTotals(b);
+
+    // Build line items (simple single product w/ quantity = hours for studio & engineer)
+    const items = [];
+    if (base.breakdown.baseSubtotal) {
+      items.push({ price_data: { currency:'usd', product_data:{ name:`Studio booking (${b.mode || 'ONE CAMERA'})` }, unit_amount: Math.round(( (String(b.mode||'ONE_CAMERA').toUpperCase()==='AUDIO_ONLY') ? 45 : 55 ) * 100) }, quantity: Math.max(1, Number(b.hours)||1) });
     }
-    const booking = req.body || {};
-
-    const violation = validateBusinessRules(booking);
-    if (violation) return res.status(400).json({ error: violation });
-
-    const totals = computeTotals(booking);
-    const hours = Math.max(1, Math.min(6, Number(booking.hours) || 1));
-    const mode = String(booking.mode || 'ONE_CAMERA').replace('_', ' ');
-    const baseRate = String(booking.mode || 'ONE_CAMERA').toUpperCase() === 'AUDIO_ONLY' ? 45 : 55;
-
-    const line_items = [];
-
-    // Base per-hour
-    line_items.push({
-      price_data: {
-        currency: 'usd',
-        unit_amount: Math.round(baseRate * 100),
-        product_data: {
-          name: `Studio booking (${mode})`,
-          description: `${hours} hour${hours > 1 ? 's' : ''}`
-        }
-      },
-      quantity: hours
-    });
-
-    // Engineer per-hour
-    if (totals.breakdown.engineerSubtotal > 0) {
-      line_items.push({
-        price_data: {
-          currency: 'usd',
-          unit_amount: 2000,
-          product_data: { name: 'Studio Engineer' }
-        },
-        quantity: hours
-      });
+    if (base.breakdown.engineerSubtotal) {
+      items.push({ price_data: { currency:'usd', product_data:{ name:'Studio Engineer' }, unit_amount: 2000 }, quantity: Math.max(1, Number(b.hours)||1) });
+    }
+    if (base.breakdown.extrasSession) {
+      items.push({ price_data: { currency:'usd', product_data:{ name:'Extras (session)' }, unit_amount: Math.round(base.breakdown.extrasSession * 100) }, quantity: 1 });
+    }
+    if (base.breakdown.postProd) {
+      items.push({ price_data: { currency:'usd', product_data:{ name:'Post Production' }, unit_amount: Math.round(base.breakdown.postProd * 100) }, quantity: 1 });
     }
 
-    // Session add-ons (flat)
-    if (totals.breakdown.extrasSession > 0) {
-      line_items.push({
-        price_data: {
-          currency: 'usd',
-          unit_amount: Math.round(totals.breakdown.extrasSession * 100),
-          product_data: { name: 'Session add-ons' }
-        },
-        quantity: 1
-      });
-    }
-
-    // Post-production (flat)
-    if (totals.breakdown.postProd > 0) {
-      line_items.push({
-        price_data: {
-          currency: 'usd',
-          unit_amount: Math.round(totals.breakdown.postProd * 100),
-          product_data: {
-            name: `Post-production (${totals.totalCams} cam${totals.totalCams === 1 ? '' : 's'})`
-          }
-        },
-        quantity: 1
-      });
-    }
-
-    // Discounts
+    // Promo code (optional)
     let discounts = [];
-    if (booking.couponCode) {
-      const promo = await lookupPromotionCode(booking.couponCode);
-      if (promo) {
-        discounts = [{ promotion_code: promo.id }];
-      }
+    if (req.body.couponCode) {
+      const promo = await findPromotionCode(String(req.body.couponCode).trim());
+      if (promo?.id) discounts = [{ promotion_code: promo.id }];
     }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
+      line_items: items,
+      allow_promotion_codes: true,
+      discounts,
       success_url: SUCCESS_URL,
       cancel_url: CANCEL_URL,
-      line_items,
-      discounts: discounts.length ? discounts : undefined, // pre-apply if valid
-      allow_promotion_codes: discounts.length ? undefined : true, // else let them add one
       metadata: {
-        customerName: booking?.customer?.name || '',
-        date: booking?.date || '',
-        startTime: booking?.startTime || '',
-        totalBeforeDiscount: String(totals.total),
-        couponCode: booking?.couponCode || ''
+        room: b.room || '',
+        date: b.date || '',
+        startTime: b.startTime || '',
+        hours: String(b.hours || 0),
+        engineerChoice: b.engineerChoice || '',
+        engineerName: b.engineerName || '',
+        peopleOnCamera: String(b.peopleOnCamera || 1),
+        couponCode: b.couponCode || ''
       }
     });
 
     res.json({ checkoutUrl: session.url });
-  } catch (err) {
-    console.error('CHECKOUT error', err);
-    res.status(400).json({ error: 'Checkout error', detail: err?.message });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+// Start
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
