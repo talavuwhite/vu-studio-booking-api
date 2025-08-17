@@ -51,10 +51,10 @@ function num(n, d = 0) {
 const HOURLY_BASE_ONE_CAM = 55;  // $55/hr
 const HOURLY_ENGINEER = 20;      // $20/hr
 const TELEPROMPTER_FEE = 25;     // per session
-const REMOTE_GUEST_FEE = 0;
-const AD_CLIPS_5_FEE = 0;
-const MEDIA_SD_USB_FEE = 0;
-const POST_PROD_PER_CAM = 100;   // $100 per camera to edit
+const REMOTE_GUEST_FEE = 10;
+const AD_CLIPS_5_FEE = 150;
+const MEDIA_SD_USB_FEE = 50;
+const POST_PROD_PER_CAM = 200;   // $100 per camera to edit
 const MIN_HOURS = 2;
 
 /**
