@@ -1,5 +1,12 @@
 // server.js — VU Studio Booking API (ESM)
-// Stripe Checkout with pricing that matches the booking page.
+//
+// Matches the booking page:
+// - Extra cameras: $25 each (flat per session)
+// - Post production: $200 first cam + $100 each additional
+// - Engineer: $20/hr when engineer != "none"
+// - Base hourly: $55/hr
+//
+// Stripe Checkout session items mirror the UI exactly.
 
 import express from 'express';
 import cors from 'cors';
@@ -8,7 +15,7 @@ import Stripe from 'stripe';
 const app = express();
 app.use(express.json());
 
-// CORS (set CORS_ORIGIN in Render if you want to restrict)
+// CORS (lock this down later to your domain if you want)
 const corsOrigin = process.env.CORS_ORIGIN || '*';
 app.use(
   cors({
@@ -27,7 +34,7 @@ const stripe = stripeSecret
   ? new Stripe(stripeSecret, { apiVersion: '2024-06-20' })
   : null;
 
-// Success/Cancel
+// Success/Cancel redirect URLs
 const SUCCESS_URL =
   process.env.SUCCESS_URL || 'https://vizionzunlimited.com/bookingsuccess';
 const CANCEL_URL =
@@ -36,40 +43,46 @@ const CANCEL_URL =
 const PORT = process.env.PORT || 10000;
 
 // ---------- helpers ----------
-function num(n, d = 0) {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : d;
+function n(v, d = 0) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
 }
 
-// ---------- PRICING (MATCHES PAGE) ----------
-const HOURLY_BASE_ONE_CAM = 55;   // $55/hr (base)
-const HOURLY_ENGINEER     = 20;   // $20/hr (if engineer != none)
+// ---------- PRICING (MATCHES CLIENT) ----------
+const HOURLY_BASE_ONE_CAM = 55;   // $55/hr
+const HOURLY_ENGINEER     = 20;   // $20/hr if engineer != "none"
 
-const EXTRA_CAMERA_FEE    = 100;  // $100 per extra camera (flat per session)
+const EXTRA_CAMERA_FEE    = 25;   // $25 per extra camera (flat per session)
 
-const TELEPROMPTER_FEE    = 25;   // session add-ons
+const TELEPROMPTER_FEE    = 25;   // add-ons (flat)
 const REMOTE_GUEST_FEE    = 10;
 const AD_CLIPS_5_FEE      = 150;
 const MEDIA_SD_USB_FEE    = 50;
 
-const POST_PROD_PER_CAM   = 200;  // $200 per cam to edit
-const MIN_HOURS           = 2;
+const MIN_HOURS = 2;
 
-// ---------- Quote calculator ----------
+/** tiered post-production: 0 -> $0, 1 -> $200, 2 -> $300, 3 -> $400, ... */
+function postProdTiered(cams) {
+  const c = Math.max(0, n(cams, 0));
+  if (c === 0) return 0;
+  return 200 + (c - 1) * 100;
+}
+
+// ---------- Quote calc ----------
 function computeQuote(body = {}) {
-  const hours = Math.max(MIN_HOURS, num(body.hours, 2));
-  const mode  = body.mode || 'ONE_CAMERA';
+  const hours = Math.max(MIN_HOURS, n(body.hours, 2));
+  const mode  = (body.mode || 'ONE_CAMERA').toUpperCase();
 
-  // Base (hourly)
+  // Base hourly
   const baseSubtotal = hours * HOURLY_BASE_ONE_CAM;
 
-  // Engineer (hourly if not "none")
-  const engineerChoice  = (body.engineerChoice || 'any').toLowerCase();
-  const engineerHourly  = engineerChoice === 'none' ? 0 : HOURLY_ENGINEER;
-  const engineerSubtotal = hours * engineerHourly;
+  // Engineer hourly (if not "none")
+  const engSel = (body.engineerChoice || 'any').toLowerCase();
+  const engHr  = engSel === 'none' ? 0 : HOURLY_ENGINEER;
+  const engineerSubtotal = hours * engHr;
 
-  // Extra cameras (flat per session)
-  const extraCameras = Math.max(0, num(body.extraCameras, 0));
+  // Extra cameras (flat per cam)
+  const extraCameras      = Math.max(0, n(body.extraCameras, 0));
   const extraCamsSubtotal = extraCameras * EXTRA_CAMERA_FEE;
 
   // Session add-ons
@@ -79,12 +92,12 @@ function computeQuote(body = {}) {
     (body.adClips5 ? AD_CLIPS_5_FEE : 0) +
     (body.mediaSdOrUsb ? MEDIA_SD_USB_FEE : 0);
 
-  // Post production
-  const postProduction   = Math.max(0, num(body.postProduction, 0));
-  const postProdSubtotal = postProduction === 0 ? 0 : postProduction * POST_PROD_PER_CAM;
+  // Tiered post-prod
+  const postProduction      = Math.max(0, n(body.postProduction, 0));
+  const postProdSubtotalUSD = postProdTiered(postProduction);
 
-  // FYI camera count (not used for price directly)
-  const peopleOnCamera = Math.max(1, num(body.peopleOnCamera, 1));
+  // FYI camera count (not charging by people)
+  const peopleOnCamera = Math.max(1, n(body.peopleOnCamera, 1));
   const totalCams      = Math.max(1, 1 + extraCameras, peopleOnCamera);
 
   const total =
@@ -92,7 +105,7 @@ function computeQuote(body = {}) {
     engineerSubtotal +
     extraCamsSubtotal +
     extrasSession +
-    postProdSubtotal;
+    postProdSubtotalUSD;
 
   return {
     total,
@@ -100,9 +113,9 @@ function computeQuote(body = {}) {
     breakdown: {
       baseSubtotal,
       engineerSubtotal,
-      extraCamsSubtotal, // << shown separately
+      extraCamsSubtotal,
       extrasSession,
-      postProd: postProdSubtotal,
+      postProd: postProdSubtotalUSD,
     },
     hours,
     mode,
@@ -129,7 +142,7 @@ app.post('/checkout', async (req, res) => {
 
     const items = [];
 
-    // Base booking (hourly)
+    // Base hourly
     items.push({
       price_data: {
         currency: 'usd',
@@ -139,7 +152,7 @@ app.post('/checkout', async (req, res) => {
       quantity: q.hours,
     });
 
-    // Engineer (hourly)
+    // Engineer hourly
     if (q.breakdown.engineerSubtotal > 0) {
       items.push({
         price_data: {
@@ -151,8 +164,8 @@ app.post('/checkout', async (req, res) => {
       });
     }
 
-    // Extra cameras (flat per cam)
-    const extraCameras = Math.max(0, num(b.extraCameras, 0));
+    // Extra cameras (flat)
+    const extraCameras = Math.max(0, n(b.extraCameras, 0));
     if (extraCameras > 0) {
       items.push({
         price_data: {
@@ -164,7 +177,7 @@ app.post('/checkout', async (req, res) => {
       });
     }
 
-    // Teleprompter (flat)
+    // Add-ons (flat)
     if (b.teleprompter) {
       items.push({
         price_data: {
@@ -175,8 +188,6 @@ app.post('/checkout', async (req, res) => {
         quantity: 1,
       });
     }
-
-    // Remote guest (flat)
     if (b.remoteGuest) {
       items.push({
         price_data: {
@@ -187,8 +198,6 @@ app.post('/checkout', async (req, res) => {
         quantity: 1,
       });
     }
-
-    // +5 Ad Clips (flat)
     if (b.adClips5) {
       items.push({
         price_data: {
@@ -199,8 +208,6 @@ app.post('/checkout', async (req, res) => {
         quantity: 1,
       });
     }
-
-    // Media to SD/USB (flat)
     if (b.mediaSdOrUsb) {
       items.push({
         price_data: {
@@ -212,16 +219,18 @@ app.post('/checkout', async (req, res) => {
       });
     }
 
-    // Post production (per cam to edit)
-    const postProduction = Math.max(0, num(b.postProduction, 0));
-    if (postProduction > 0) {
+    // Post-production (tiered)
+    const pp = Math.max(0, n(b.postProduction, 0));
+    if (pp > 0) {
+      // charge the total tiered amount as a single line item for clarity
+      const subtotalCents = postProdTiered(pp) * 100;
       items.push({
         price_data: {
           currency: 'usd',
-          product_data: { name: 'Post Production (cams to edit)' },
-          unit_amount: POST_PROD_PER_CAM * 100,
+          product_data: { name: `Post Production (${pp} cam${pp>1?'s':''})` },
+          unit_amount: subtotalCents,
         },
-        quantity: postProduction,
+        quantity: 1,
       });
     }
 
