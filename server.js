@@ -1,12 +1,10 @@
 // server.js — VU Studio Booking API (ESM)
-//
-// Matches the booking page:
-// - Extra cameras: $25 each (flat per session)
-// - Post production: $200 first cam + $100 each additional
-// - Engineer: $20/hr when engineer != "none"
-// - Base hourly: $55/hr
-//
-// Stripe Checkout session items mirror the UI exactly.
+// Pricing rules (must match the front-end):
+// - Mode hourly: ONE_CAMERA=$55/hr, AUDIO_ONLY=$45/hr
+// - Engineer: $20/hr if engineerChoice !== "none"
+// - Extra cameras: $25 each per session (uses numeric extraCameras)
+// - Add-ons (flat/session): Teleprompter $25, RemoteGuest $10, AdClips5 $150, Media SD/USB $50
+// - Post production (tiered): 0->$0, 1->$200, then +$100 for each additional camera
 
 import express from 'express';
 import cors from 'cors';
@@ -15,7 +13,7 @@ import Stripe from 'stripe';
 const app = express();
 app.use(express.json());
 
-// CORS (lock this down later to your domain if you want)
+// CORS (tighten later to your domain if you want)
 const corsOrigin = process.env.CORS_ORIGIN || '*';
 app.use(
   cors({
@@ -23,7 +21,7 @@ app.use(
   })
 );
 
-// Stripe secret (Render env var: STRIPE_SECRET_KEY recommended)
+// Stripe
 const stripeSecret =
   process.env.STRIPE_SECRET_KEY ||
   process.env.STRIPE_SECRET_KEY_LIVE ||
@@ -34,7 +32,7 @@ const stripe = stripeSecret
   ? new Stripe(stripeSecret, { apiVersion: '2024-06-20' })
   : null;
 
-// Success/Cancel redirect URLs
+// Success/Cancel
 const SUCCESS_URL =
   process.env.SUCCESS_URL || 'https://vizionzunlimited.com/bookingsuccess';
 const CANCEL_URL =
@@ -48,64 +46,74 @@ function n(v, d = 0) {
   return Number.isFinite(x) ? x : d;
 }
 
-// ---------- PRICING (MATCHES CLIENT) ----------
-const HOURLY_BASE_ONE_CAM = 55;   // $55/hr
-const HOURLY_ENGINEER     = 20;   // $20/hr if engineer != "none"
+function envModeFromKey(key) {
+  if (!key) return 'none';
+  if (key.startsWith('sk_live_')) return 'live';
+  if (key.startsWith('sk_test_')) return 'test';
+  return 'unknown';
+}
 
-const EXTRA_CAMERA_FEE    = 25;   // $25 per extra camera (flat per session)
+// ---------- PRICING ----------
+const HOURLY_ONE_CAMERA = 55; // $/hr
+const HOURLY_AUDIO_ONLY = 45; // $/hr
+const HOURLY_ENGINEER   = 20; // $/hr if engineer
 
-const TELEPROMPTER_FEE    = 25;   // add-ons (flat)
-const REMOTE_GUEST_FEE    = 10;
-const AD_CLIPS_5_FEE      = 150;
-const MEDIA_SD_USB_FEE    = 50;
+const EXTRA_CAMERA_FEE  = 25; // $ per extra camera (flat per session)
+
+const TELEPROMPTER_FEE  = 25;
+const REMOTE_GUEST_FEE  = 10;
+const AD_CLIPS_5_FEE    = 150;
+const MEDIA_SD_USB_FEE  = 50;
 
 const MIN_HOURS = 2;
 
-/** tiered post-production: 0 -> $0, 1 -> $200, 2 -> $300, 3 -> $400, ... */
+/** post-production tier: 0->$0, 1->$200, 2->$300, 3->$400 ... */
 function postProdTiered(cams) {
   const c = Math.max(0, n(cams, 0));
   if (c === 0) return 0;
   return 200 + (c - 1) * 100;
 }
 
-// ---------- Quote calc ----------
+/** Compute quote using the rules above */
 function computeQuote(body = {}) {
   const hours = Math.max(MIN_HOURS, n(body.hours, 2));
   const mode  = (body.mode || 'ONE_CAMERA').toUpperCase();
 
-  // Base hourly
-  const baseSubtotal = hours * HOURLY_BASE_ONE_CAM;
+  // Hourly based on mode
+  const baseHourly =
+    mode === 'AUDIO_ONLY' ? HOURLY_AUDIO_ONLY : HOURLY_ONE_CAMERA;
+  const baseSubtotal = hours * baseHourly;
 
-  // Engineer hourly (if not "none")
-  const engSel = (body.engineerChoice || 'any').toLowerCase();
-  const engHr  = engSel === 'none' ? 0 : HOURLY_ENGINEER;
-  const engineerSubtotal = hours * engHr;
+  // Engineer
+  const engChoice = (body.engineerChoice || 'any').toLowerCase();
+  const engineerHourly = engChoice === 'none' ? 0 : HOURLY_ENGINEER;
+  const engineerSubtotal = hours * engineerHourly;
 
-  // Extra cameras (flat per cam)
-  const extraCameras      = Math.max(0, n(body.extraCameras, 0));
-  const extraCamsSubtotal = extraCameras * EXTRA_CAMERA_FEE;
-
-  // Session add-ons
+  // Add-ons (flat)
   const extrasSession =
     (body.teleprompter ? TELEPROMPTER_FEE : 0) +
     (body.remoteGuest ? REMOTE_GUEST_FEE : 0) +
     (body.adClips5 ? AD_CLIPS_5_FEE : 0) +
     (body.mediaSdOrUsb ? MEDIA_SD_USB_FEE : 0);
 
-  // Tiered post-prod
-  const postProduction      = Math.max(0, n(body.postProduction, 0));
-  const postProdSubtotalUSD = postProdTiered(postProduction);
+  // Extra cameras (flat × count)
+  const extraCameras = Math.max(0, n(body.extraCameras, 0));
+  const extraCamsSubtotal = extraCameras * EXTRA_CAMERA_FEE;
 
-  // FYI camera count (not charging by people)
+  // Post production tier
+  const postProduction = Math.max(0, n(body.postProduction, 0));
+  const postProdSubtotal = postProdTiered(postProduction);
+
+  // FYI cam count (display only)
   const peopleOnCamera = Math.max(1, n(body.peopleOnCamera, 1));
-  const totalCams      = Math.max(1, 1 + extraCameras, peopleOnCamera);
+  const totalCams = Math.max(1, 1 + extraCameras, peopleOnCamera);
 
   const total =
     baseSubtotal +
     engineerSubtotal +
-    extraCamsSubtotal +
     extrasSession +
-    postProdSubtotalUSD;
+    extraCamsSubtotal +
+    postProdSubtotal;
 
   return {
     total,
@@ -113,9 +121,9 @@ function computeQuote(body = {}) {
     breakdown: {
       baseSubtotal,
       engineerSubtotal,
-      extraCamsSubtotal,
       extrasSession,
-      postProd: postProdSubtotalUSD,
+      extraCamsSubtotal,
+      postProd: postProdSubtotal,
     },
     hours,
     mode,
@@ -123,6 +131,14 @@ function computeQuote(body = {}) {
 }
 
 // ---------- Routes ----------
+app.get('/env-check', (_req, res) => {
+  res.json({
+    hasKey: !!stripeSecret,
+    mode: envModeFromKey(stripeSecret),
+    port: String(PORT),
+  });
+});
+
 app.post('/quote', (req, res) => {
   try {
     res.json(computeQuote(req.body));
@@ -139,15 +155,17 @@ app.post('/checkout', async (req, res) => {
 
     const b = req.body || {};
     const q = computeQuote(b);
-
     const items = [];
 
-    // Base hourly
+    // Base hourly — name reflects chosen mode
+    const baseName =
+      q.mode === 'AUDIO_ONLY' ? 'Studio booking (Audio Only)' : 'Studio booking (One Camera)';
+    const baseUnit = (q.mode === 'AUDIO_ONLY' ? HOURLY_AUDIO_ONLY : HOURLY_ONE_CAMERA) * 100;
     items.push({
       price_data: {
         currency: 'usd',
-        product_data: { name: `Studio booking (${q.mode})` },
-        unit_amount: HOURLY_BASE_ONE_CAM * 100,
+        product_data: { name: baseName },
+        unit_amount: baseUnit,
       },
       quantity: q.hours,
     });
@@ -161,19 +179,6 @@ app.post('/checkout', async (req, res) => {
           unit_amount: HOURLY_ENGINEER * 100,
         },
         quantity: q.hours,
-      });
-    }
-
-    // Extra cameras (flat)
-    const extraCameras = Math.max(0, n(b.extraCameras, 0));
-    if (extraCameras > 0) {
-      items.push({
-        price_data: {
-          currency: 'usd',
-          product_data: { name: 'Extra Camera' },
-          unit_amount: EXTRA_CAMERA_FEE * 100,
-        },
-        quantity: extraCameras,
       });
     }
 
@@ -219,15 +224,27 @@ app.post('/checkout', async (req, res) => {
       });
     }
 
-    // Post-production (tiered)
+    // Extra cameras (flat × count)
+    const extraCameras = Math.max(0, n(b.extraCameras, 0));
+    if (extraCameras > 0) {
+      items.push({
+        price_data: {
+          currency: 'usd',
+          product_data: { name: 'Extra Camera' },
+          unit_amount: EXTRA_CAMERA_FEE * 100,
+        },
+        quantity: extraCameras,
+      });
+    }
+
+    // Post production: charge the total tiered amount as a single line
     const pp = Math.max(0, n(b.postProduction, 0));
     if (pp > 0) {
-      // charge the total tiered amount as a single line item for clarity
       const subtotalCents = postProdTiered(pp) * 100;
       items.push({
         price_data: {
           currency: 'usd',
-          product_data: { name: `Post Production (${pp} cam${pp>1?'s':''})` },
+          product_data: { name: `Post Production (${pp} cam${pp > 1 ? 's' : ''})` },
           unit_amount: subtotalCents,
         },
         quantity: 1,
@@ -237,7 +254,7 @@ app.post('/checkout', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: items,
-      allow_promotion_codes: true,
+      allow_promotion_codes: true, // customer can enter coupons at checkout
       success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
       cancel_url: CANCEL_URL,
     });
@@ -247,10 +264,6 @@ app.post('/checkout', async (req, res) => {
     console.error('checkout error:', err);
     res.status(400).json({ error: 'Checkout failed', detail: String(err) });
   }
-});
-
-app.get('/env-check', (_req, res) => {
-  res.json({ hasKey: !!stripeSecret, port: String(PORT) });
 });
 
 app.get('/', (_req, res) => res.send('OK'));
